@@ -1,12 +1,13 @@
 # coding: utf-8
-import os
-import sys
-import glob
 import ctypes
-import warnings
+import glob
 import hashlib
+import os
 import site
+import sys
+import warnings
 from ctypes.util import find_library
+from typing import ClassVar, Dict, Optional
 
 import numpy as np
 import scipy.sparse as sp
@@ -56,7 +57,7 @@ class PyPardisoSolver:
 
     """
 
-    def __init__(self, mtype=11, phase=13, size_limit_storage=5e7):
+    def __init__(self, mtype: int = 11, phase: int = 13, size_limit_storage: int = 5e7, use_64bit: bool = False):
 
         self.libmkl = None
 
@@ -87,10 +88,13 @@ class PyPardisoSolver:
                 f'{sys.prefix}/[Ll]ib*/**/*mkl_rt*', recursive=True
             ) or glob.glob(
                 f'{site.USER_BASE}/[Ll]ib*/**/*mkl_rt*', recursive=True
+            ) or glob.glob(
+                '/opt/intel/oneapi/mkl/**/*mkl_rt*', recursive=True
             )
             for path in sorted(globs, key=len):
                 try:
                     self.libmkl = ctypes.CDLL(path)
+                    print(f"Using mkl library '{path}'")
                     break
                 except (OSError, ImportError):
                     pass
@@ -103,7 +107,14 @@ class PyPardisoSolver:
         else:
             self.libmkl = ctypes.CDLL(mkl_rt)
 
-        self._mkl_pardiso = self.libmkl.pardiso
+        if use_64bit:
+            self._mkl_pardiso = self.libmkl.pardiso_64
+            c_int = ctypes.c_int64
+            n_int = np.int64
+        else:
+            self._mkl_pardiso = self.libmkl.pardiso
+            c_int = ctypes.c_int32
+            n_int = np.int32
 
         # determine 32bit or 64bit architecture
         if ctypes.sizeof(ctypes.c_void_p) == 8:
@@ -112,27 +123,27 @@ class PyPardisoSolver:
             self._pt_type = (ctypes.c_int32, np.int32)
 
         self._mkl_pardiso.argtypes = [ctypes.POINTER(self._pt_type[0]),    # pt
-                                      ctypes.POINTER(ctypes.c_int32),      # maxfct
-                                      ctypes.POINTER(ctypes.c_int32),      # mnum
-                                      ctypes.POINTER(ctypes.c_int32),      # mtype
-                                      ctypes.POINTER(ctypes.c_int32),      # phase
-                                      ctypes.POINTER(ctypes.c_int32),      # n
+                                      ctypes.POINTER(c_int),               # maxfct
+                                      ctypes.POINTER(c_int),               # mnum
+                                      ctypes.POINTER(c_int),               # mtype
+                                      ctypes.POINTER(c_int),               # phase
+                                      ctypes.POINTER(c_int),               # n
                                       ctypes.POINTER(None),                # a
-                                      ctypes.POINTER(ctypes.c_int32),      # ia
-                                      ctypes.POINTER(ctypes.c_int32),      # ja
-                                      ctypes.POINTER(ctypes.c_int32),      # perm
-                                      ctypes.POINTER(ctypes.c_int32),      # nrhs
-                                      ctypes.POINTER(ctypes.c_int32),      # iparm
-                                      ctypes.POINTER(ctypes.c_int32),      # msglvl
+                                      ctypes.POINTER(c_int),               # ia
+                                      ctypes.POINTER(c_int),               # ja
+                                      ctypes.POINTER(c_int),               # perm
+                                      ctypes.POINTER(c_int),               # nrhs
+                                      ctypes.POINTER(c_int),               # iparm
+                                      ctypes.POINTER(c_int),               # msglvl
                                       ctypes.POINTER(None),                # b
                                       ctypes.POINTER(None),                # x
-                                      ctypes.POINTER(ctypes.c_int32)]      # error
+                                      ctypes.POINTER(c_int)]               # error
 
         self._mkl_pardiso.restype = None
 
         self.pt = np.zeros(64, dtype=self._pt_type[1])
-        self.iparm = np.zeros(64, dtype=np.int32)
-        self.perm = np.zeros(0, dtype=np.int32)
+        self.iparm = np.zeros(64, dtype=n_int)
+        self.perm = np.zeros(0, dtype=n_int)
 
         self.mtype = mtype
         self.phase = phase
@@ -141,6 +152,14 @@ class PyPardisoSolver:
         self.factorized_A = sp.csr_matrix((0, 0))
         self.size_limit_storage = size_limit_storage
         self._solve_transposed = False
+
+        self.use_64bit = use_64bit
+
+    def reconfigure(self, use_64bit: Optional[bool], msglvl: Optional[bool] = None):
+        if use_64bit is not None:
+            self.__init__(use_64bit=use_64bit)
+        if msglvl is not None:
+            self.msglvl = msglvl
 
     def factorize(self, A):
         """
@@ -266,8 +285,14 @@ class PyPardisoSolver:
     def _call_pardiso(self, A, b):
 
         x = np.zeros_like(b)
-        pardiso_error = ctypes.c_int32(0)
-        c_int32_p = ctypes.POINTER(ctypes.c_int32)
+        if self.use_64bit:
+            pardiso_error = ctypes.c_int64(0)
+            c_int = ctypes.c_int64
+            c_int_p = ctypes.POINTER(ctypes.c_int64)
+        else:
+            pardiso_error = ctypes.c_int32(0)
+            c_int = ctypes.c_int32
+            c_int_p = ctypes.POINTER(ctypes.c_int32)
         c_float64_p = ctypes.POINTER(ctypes.c_double)
 
         # 1-based indexing
@@ -275,18 +300,18 @@ class PyPardisoSolver:
         ja = A.indices + 1
 
         self._mkl_pardiso(self.pt.ctypes.data_as(ctypes.POINTER(self._pt_type[0])),  # pt
-                          ctypes.byref(ctypes.c_int32(1)),  # maxfct
-                          ctypes.byref(ctypes.c_int32(1)),  # mnum
-                          ctypes.byref(ctypes.c_int32(self.mtype)),  # mtype -> 11 for real-nonsymetric
-                          ctypes.byref(ctypes.c_int32(self.phase)),  # phase -> 13
-                          ctypes.byref(ctypes.c_int32(A.shape[0])),  # N -> number of equations/size of matrix
+                          ctypes.byref(c_int(1)),  # maxfct
+                          ctypes.byref(c_int(1)),  # mnum
+                          ctypes.byref(c_int(self.mtype)),  # mtype -> 11 for real-nonsymetric
+                          ctypes.byref(c_int(self.phase)),  # phase -> 13
+                          ctypes.byref(c_int(A.shape[0])),  # N -> number of equations/size of matrix
                           A.data.ctypes.data_as(c_float64_p),  # A -> non-zero entries in matrix
-                          ia.ctypes.data_as(c_int32_p),  # ia -> csr-indptr
-                          ja.ctypes.data_as(c_int32_p),  # ja -> csr-indices
-                          self.perm.ctypes.data_as(c_int32_p),  # perm -> empty
-                          ctypes.byref(ctypes.c_int32(1 if b.ndim == 1 else b.shape[1])),  # nrhs
-                          self.iparm.ctypes.data_as(c_int32_p),  # iparm-array
-                          ctypes.byref(ctypes.c_int32(self.msglvl)),  # msg-level -> 1: statistical info is printed
+                          ia.ctypes.data_as(c_int_p),  # ia -> csr-indptr
+                          ja.ctypes.data_as(c_int_p),  # ja -> csr-indices
+                          self.perm.ctypes.data_as(c_int_p),  # perm -> empty
+                          ctypes.byref(c_int(1 if b.ndim == 1 else b.shape[1])),  # nrhs
+                          self.iparm.ctypes.data_as(c_int_p),  # iparm-array
+                          ctypes.byref(c_int(self.msglvl)),  # msg-level -> 1: statistical info is printed
                           b.ctypes.data_as(c_float64_p),  # b -> right-hand side vector/matrix
                           x.ctypes.data_as(c_float64_p),  # x -> output
                           ctypes.byref(pardiso_error))  # pardiso error
@@ -349,9 +374,35 @@ class PyPardisoWarning(UserWarning):
 
 class PyPardisoError(Exception):
 
+    Errors: ClassVar[Dict[str, str]] = {
+        "-1": "Input inconsistent.",
+        "-2": "Not enough memory.",
+        "-3": "Reordering problem.",
+        "-4": "Zero pivot, numerical fact. or iterative refinement problem.",
+        "-5": "Unclassified (internal) error.",
+        "-6": "Preordering failed (matrix types 11, 13 only).",
+        "-7": "Diagonal matrix problem.",
+        "-8": "32-bit integer overflow problem.",
+        "-10": "No license file pardiso.lic found.",
+        "-11": "License is expired.",
+        "-12": "Wrong username or hostname.",
+        "-100": "Reached maximum number of Krylov-subspace iteration in iterative solver.",
+        "-101": "No sufficient convergence in Krylov-subspace iteration within 25 iterations.",
+        "-102": "Error in Krylov-subspace iteration.",
+        "-103": "Break-Down in Krylov-subspace iteration.",
+    }
+
     def __init__(self, value):
         self.value = value
 
     def __str__(self):
-        return ('The Pardiso solver failed with error code {}. '
-                'See Pardiso documentation for details.'.format(self.value))
+        return (f"The Pardiso solver failed with error code {self.value}: '{self.error}'\n"
+                "See Pardiso documentation for details.")
+
+    @property
+    def error(self) -> str:
+        str_ = self.Errors.get(str(self.value))
+        if str_ is None:
+            return "Unidentified error code."
+        else:
+            return str_

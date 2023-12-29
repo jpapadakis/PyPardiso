@@ -1,8 +1,9 @@
 # coding: utf-8
 import functools
-import scipy.sparse as sp
-from .pardiso_wrapper import PyPardisoSolver
 
+import scipy.sparse as sp
+
+from .pardiso_wrapper import PyPardisoSolver
 
 # pypardsio_solver is used for the 'spsolve' and 'factorized' functions. Python crashes on windows if multiple
 # instances of PyPardisoSolver make calls to the Pardiso library
@@ -41,6 +42,14 @@ def spsolve(A, b, factorize=True, squeeze=True, solver=pypardiso_solver, *args, 
     if sp.isspmatrix_csc(A):
         A = A.tocsr()  # fixes issue with brightway2 technosphere matrix
 
+    use_64bit = kwargs.get("use_64bit")
+    solver.reconfigure(use_64bit=use_64bit, msglvl=kwargs.get("verbose"))
+    use_64bit = solver.use_64bit
+
+    if use_64bit:
+        A.indices = A.indices.astype('int64')
+        A.indptr = A.indptr.astype('int64')
+
     solver._check_A(A)
     if factorize and not solver._is_already_factorized(A):
         solver.factorize(A)
@@ -74,6 +83,13 @@ def factorized(A, solver=pypardiso_solver, *args, **kwargs):
         gain in PyPardiso by using factorized instead of spsolve.
 
     """
+    use_64bit = kwargs.get("use_64bit")
+    solver.reconfigure(use_64bit, msglvl=kwargs.get("verbose"))
+    use_64bit = solver.use_64bit
+    if use_64bit:
+        A.indices = A.indices.astype('int64')
+        A.indptr = A.indptr.astype('int64')
+
     solve_b = functools.partial(spsolve, A.tocsr().copy(), squeeze=False, solver=solver)
 
     return solve_b
